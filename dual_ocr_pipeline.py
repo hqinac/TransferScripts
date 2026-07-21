@@ -48,6 +48,7 @@ import asyncio
 import base64
 import csv
 import html
+import io
 import json
 import pathlib
 import re
@@ -126,10 +127,21 @@ COMPARE_PUNCTUATION = str.maketrans(
 )
 
 
+def open_csv_with_fallback(path):
+    """优先按 UTF-8-SIG 读取 CSV，失败时回退到 GB18030。"""
+
+    try:
+        text = path.read_text(encoding="utf-8-sig")
+    except UnicodeDecodeError:
+        text = path.read_text(encoding="gb18030")
+        print(f"CSV 使用 GB18030 解码：{path}")
+    return io.StringIO(text, newline="")
+
+
 def load_b_tasks(selected_books=None):
     """从表 B 读取正文转换任务，并校验 PDF、页码范围及逐页 metadata。"""
 
-    with TABLE_B_PATH.open("r", encoding="utf-8-sig", newline="") as f:
+    with open_csv_with_fallback(TABLE_B_PATH) as f:
         rows = [
             (row_number, row)
             for row_number, row in enumerate(csv.DictReader(f), start=2)
@@ -213,7 +225,7 @@ def load_book_infos(book_names):
             f"{', '.join(path.name for path in candidates) or '无'}"
         )
 
-    with candidates[0].open("r", encoding="utf-8-sig", newline="") as f:
+    with open_csv_with_fallback(candidates[0]) as f:
         rows = list(csv.reader(f))
     if len(rows) < 3:
         raise ValueError("表 A 至少需要三行表头")

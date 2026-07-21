@@ -11,23 +11,35 @@ import pypdfium2 as pdfium
 
 
 BASE_URL = "http://172.168.48.51:4002"
-CSV_PATH = pathlib.Path("风水书籍转换/1-DD-RAG应用 - B-步骤2-PDF章节分类.csv")
-PDF_DIR = pathlib.Path(r"D:\pythonprojects\风水图片rag测试\测试书籍")
-OUTPUT_DIR = pathlib.Path("风水书籍转换")
+#TABLE_PATH = pathlib.Path("风水书籍转换")
+#TABLE_B_PATH = TABLE_PATH / "1-DD-RAG应用 - B-步骤2-PDF章节分类.csv"
+#PDF_DIR = pathlib.Path(r"D:\pythonprojects\风水图片rag测试\测试书籍")
+#OUTPUT_DIR = pathlib.Path("风水书籍转换")
 
 
-EXCLUDE_STRUCTURES = []
-EXCLUDE_SCENES = ["商业建筑", "其他建筑"]
-EXCLUDE_BRANCHES = ["周边环境", "公共空间"]
-EXCLUDE_PAIRS = []  # 例如 [("住宅", "通用"), ("商业建筑", "周边环境")]
-DRY_RUN = False
+#EXCLUDE_STRUCTURES = []
+#EXCLUDE_SCENES = ["商业建筑", "其他建筑"]
+#EXCLUDE_BRANCHES = ["周边环境", "公共空间"]
+#EXCLUDE_PAIRS = []  # 例如 [("住宅", "通用"), ("商业建筑", "周边环境")]
+#DRY_RUN = False
+
+
+def open_csv_with_fallback(path):
+    """优先按 UTF-8-SIG 读取 CSV，失败时回退到 GB18030。"""
+
+    try:
+        text = path.read_text(encoding="utf-8-sig")
+    except UnicodeDecodeError:
+        text = path.read_text(encoding="gb18030")
+        print(f"CSV 使用 GB18030 解码：{path}")
+    return io.StringIO(text, newline="")
 
 
 def load_tasks():
     tasks = []
     occupied_pages = {}
 
-    with CSV_PATH.open("r", encoding="utf-8-sig", newline="") as f:
+    with open_csv_with_fallback(TABLE_B_PATH) as f:
         for row_number, row in enumerate(csv.DictReader(f), start=2):
             chapter = row["开头章节标题"].strip()
             if not chapter or row["属性"].strip() == "说明":
