@@ -1,6 +1,7 @@
 r"""目录分层、双 OCR 对比和人工复核处理脚本。
 
-* 使用前需要先修改脚本开头的目录位置参数：TABLE_PATH PDF_DIR OUTPUT_DIR
+* 使用前需要先修改本脚本开头的 TABLE_PATH、PDF_DIR、OUTPUT_DIR。
+  表 A、表 B 都从 TABLE_PATH 读取，OCR 结果只写入 OUTPUT_DIR。
 * md 文件中表格图片需要使用md阅读器进行渲染阅读，推荐使用obesdian
 使用顺序：
 1. outline：识别目录页、调用大模型划分目录层级，并生成
@@ -37,7 +38,7 @@ r"""目录分层、双 OCR 对比和人工复核处理脚本。
     --overwrite                仅 compare 阶段使用：在 OCR 前清空原有 page_*.md 和
                                review.xlsx，保留 outline.md；已有完整 OCR 页面仍会跳过。
 
-未传入反选参数或 dry-run 参数时，使用 layout_pages_transfer.py 顶部的全局变量；
+未传入反选参数或 dry-run 参数时，使用本脚本顶部的全局变量；
 命令行参数的优先级高于全局变量。表 B 中对应 PDF 不存在的书籍会直接跳过。
 MinerU 按每批五页并发处理，批次之间串行。
 """
@@ -63,20 +64,24 @@ from openpyxl.worksheet.datavalidation import DataValidation
 import layout_pages_transfer as paddle
 
 
-
-
-
-TABLE_B_PATH = pathlib.Path("风水书籍转换")
+TABLE_PATH = pathlib.Path("风水书籍转换")
 PDF_DIR = pathlib.Path(r"D:\pythonprojects\风水图片rag测试\测试书籍")
 OUTPUT_DIR = pathlib.Path("风水书籍转换")
 
 
 TABLE_A_PATTERN = "1-DD-RAG应用 - A-整体进度汇总*.csv"
-PADDLE_BASE_URL = paddle.BASE_URL
+TABLE_B_PATH = TABLE_PATH / "1-DD-RAG应用 - B-步骤2-PDF章节分类.csv"
+
+PADDLE_BASE_URL = "http://172.168.48.51:4002"
 MINERU_URL = "http://172.168.47.52:4003/file_parse"
 OUTLINE_BASE_URL = "http://172.168.48.51:4000/v1"
 OUTLINE_MODEL = "qwen3.5-122b"
 MINERU_BATCH_SIZE = 5
+EXCLUDE_STRUCTURES = []
+EXCLUDE_SCENES = ["商业建筑", "其他建筑"]
+EXCLUDE_BRANCHES = ["周边环境", "公共空间"]
+EXCLUDE_PAIRS = []  # 例如 [("住宅", "通用"), ("商业建筑", "周边环境")]
+DRY_RUN = False
 REVIEW_OPTIONS = ("保留PaddleOCR", "保留MinerU", "手动merge", "删除该页", "两种都可")
 
 OUTLINE_RE = re.compile(
@@ -188,7 +193,7 @@ def load_b_tasks(selected_books=None):
 def load_book_infos(book_names):
     """从表 A 为待处理书籍读取目录页范围和目录页码偏移。"""
 
-    candidates = list(OUTPUT_DIR.glob(TABLE_A_PATTERN))
+    candidates = list(TABLE_PATH.glob(TABLE_A_PATTERN))
     if len(candidates) != 1:
         raise FileNotFoundError(
             f"表 A 应唯一匹配 {TABLE_A_PATTERN}，实际找到："
@@ -1061,6 +1066,23 @@ def finalize_stage(included, infos, dry_run):
         finalize_book(book, book_tasks, infos[book])
 
 
+def resolve_config(args):
+    """用 dual 自身的全局默认值解析反选和 dry-run 参数。"""
+
+    pair_values = EXCLUDE_PAIRS if args.exclude_pair is None else args.exclude_pair
+    return {
+        "structures": set(
+            EXCLUDE_STRUCTURES if args.exclude_structure is None else args.exclude_structure
+        ),
+        "scenes": set(EXCLUDE_SCENES if args.exclude_scene is None else args.exclude_scene),
+        "branches": set(
+            EXCLUDE_BRANCHES if args.exclude_branch is None else args.exclude_branch
+        ),
+        "pairs": paddle.parse_pairs(pair_values),
+        "dry_run": DRY_RUN if args.dry_run is None else args.dry_run,
+    }
+
+
 def build_parser():
     """定义三阶段流程及反选、覆盖和试运行命令行参数。"""
 
@@ -1082,7 +1104,7 @@ def build_parser():
 async def main(args):
     """加载配置与表格任务，并调度 outline、compare 或 finalize 阶段。"""
 
-    config = paddle.resolve_config(args)
+    config = resolve_config(args)
     tasks, missing_books = load_b_tasks(set(args.book) if args.book else None)
     if not tasks:
         print(f"没有可处理的 PDF；已跳过 {len(missing_books)} 本")

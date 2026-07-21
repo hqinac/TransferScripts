@@ -11,9 +11,9 @@ import pypdfium2 as pdfium
 
 
 BASE_URL = "http://172.168.48.51:4002"
-CSV_PATH = pathlib.Path("风水书籍转换/1-DD-RAG应用 - B-步骤2-PDF章节分类.csv")
-PDF_DIR = pathlib.Path(r"D:\pythonprojects\风水图片rag测试\测试书籍")
-OUTPUT_DIR = pathlib.Path("风水书籍转换")
+#CSV_PATH = pathlib.Path("风水书籍转换/1-DD-RAG应用 - B-步骤2-PDF章节分类.csv")
+#PDF_DIR = pathlib.Path(r"D:\pythonprojects\风水图片rag测试\测试书籍")
+#OUTPUT_DIR = pathlib.Path("风水书籍转换")
 
 
 EXCLUDE_STRUCTURES = []
