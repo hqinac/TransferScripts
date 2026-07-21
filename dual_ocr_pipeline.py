@@ -64,6 +64,7 @@ from openpyxl.worksheet.datavalidation import DataValidation
 import layout_pages_transfer as paddle
 
 
+# dual 是路径的唯一来源；layout 的默认路径只供其被单独执行时使用。
 TABLE_PATH = pathlib.Path("风水书籍转换")
 PDF_DIR = pathlib.Path(r"D:\pythonprojects\风水图片rag测试\测试书籍")
 OUTPUT_DIR = pathlib.Path("风水书籍转换")
@@ -83,6 +84,18 @@ EXCLUDE_BRANCHES = ["周边环境", "公共空间"]
 EXCLUDE_PAIRS = []  # 例如 [("住宅", "通用"), ("商业建筑", "周边环境")]
 DRY_RUN = False
 REVIEW_OPTIONS = ("保留PaddleOCR", "保留MinerU", "手动merge", "删除该页", "两种都可")
+
+# layout 被本脚本导入后，所有共享配置统一由 dual 单向覆盖。
+paddle.TABLE_PATH = TABLE_PATH
+paddle.TABLE_B_PATH = TABLE_B_PATH
+paddle.PDF_DIR = PDF_DIR
+paddle.OUTPUT_DIR = OUTPUT_DIR
+paddle.BASE_URL = PADDLE_BASE_URL
+paddle.EXCLUDE_STRUCTURES = EXCLUDE_STRUCTURES
+paddle.EXCLUDE_SCENES = EXCLUDE_SCENES
+paddle.EXCLUDE_BRANCHES = EXCLUDE_BRANCHES
+paddle.EXCLUDE_PAIRS = EXCLUDE_PAIRS
+paddle.DRY_RUN = DRY_RUN
 
 OUTLINE_RE = re.compile(
     r"^(?P<heading>#{2,6}\s+)?(?P<title>.+?)"
