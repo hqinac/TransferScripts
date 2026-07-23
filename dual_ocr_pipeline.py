@@ -5,9 +5,11 @@ r"""目录分层、双 OCR 对比和人工复核处理脚本。
 * md 文件中表格图片需要使用md阅读器进行渲染阅读，推荐使用obesdian
 使用顺序：
 1. outline：识别目录页、调用大模型划分目录层级，并生成
-   风水书籍转换/<书名>/final_result/outline.md。完成后暂停，人工检查目录。
+   风水书籍转换/<书名>/final_result/outline.md。已有书名/outline.md 时跳过目录 OCR，
+   已有 final_result/outline.md 时再跳过大模型。完成后暂停，人工检查目录。
 2. compare：先从已检查的目录中删除反选章节，再对入选正文页执行 PaddleOCR 和
-   MinerU；正常页面写入 final_result，异常页面写入 review.xlsx。完成后暂停复核。
+   MinerU；正常页面写入 final_result，异常页面写入 review.xlsx。无页码目录会从
+   正文标题回填页码，未匹配标题保留在 outline.md 中并在全部书完成后提示。完成后暂停复核。
 3. finalize：根据 review.xlsx 的处理方式生成最终页面、修正标题层级并输出 result.json。
    处理方式为空的行会跳过，整张表处理完后在控制台打印对应 PDF 页码。
 
@@ -69,6 +71,7 @@ import layout_pages_transfer as paddle
 TABLE_PATH = pathlib.Path("风水书籍转换")
 PDF_DIR = pathlib.Path(r"D:\pythonprojects\风水图片rag测试\测试书籍")
 OUTPUT_DIR = pathlib.Path("风水书籍转换")
+IGNORED_TITLE_DECORATORS = "·"
 
 
 TABLE_A_PATTERN = "1-DD-RAG应用 - A-整体进度汇总*.csv"
@@ -102,6 +105,8 @@ OUTLINE_RE = re.compile(
     r"^(?P<heading>#{2,6}\s+)?(?P<title>.+?)"
     r"(?:\s*[.…·•．。_—-]{2,}\s*|\s{2,})(?P<page>\d+)\s*$"
 )
+OUTLINE_TITLE_RE = re.compile(r"^(?P<heading>#{2,6})\s+(?P<title>.+?)\s*$")
+DIRECTORY_HEADING_RE = re.compile(r"^\s*#+\s*目录\s*$")
 HEADING_RE = re.compile(r"^(?P<indent>\s*)#{1,6}\s+(?P<title>.+?)\s*$")
 MEDIA_TYPES = {"image", "table", "chart", "image_body", "table_body"}
 COMPARE_PUNCTUATION = str.maketrans(
@@ -206,6 +211,7 @@ def load_b_tasks(selected_books=None):
             {
                 "row_number": row_number,
                 "chapter": row["开头章节标题"].strip(),
+                "end_chapter": row["结尾章节标题"].strip(),
                 "pdf_path": pdf_path,
                 "start_page": start_page,
                 "end_page": end_page,
@@ -289,6 +295,8 @@ def normalize_title(value):
     """统一标题字符、Markdown 标记和空白，供跨 OCR 标题匹配使用。"""
 
     value = unicodedata.normalize("NFKC", value)
+    for decorator in IGNORED_TITLE_DECORATORS:
+        value = value.replace(decorator, "")
     value = re.sub(r"[`*_]", "", value)
     return re.sub(r"\s+", "", value).strip("：:。.．")
 
@@ -416,21 +424,52 @@ def filter_numbered_outline_lines(text):
     return "\n".join(lines) + ("\n" if lines else "")
 
 
-def parse_outline(text, require_headings=True):
-    """解析目录标题、书本页码及 Markdown 层级，并拒绝格式异常行。"""
+def outline_has_page_numbers(text):
+    """按最后一个非空目录行是否以数字结尾，判断该书目录是否带页码。"""
+
+    lines = [line for line in text.splitlines() if line.strip()]
+    if not lines:
+        raise ValueError("目录 OCR 结果为空")
+    return bool(re.search(r"\d\s*$", lines[-1]))
+
+
+def filter_pageless_outline_lines(text):
+    """无页码目录仅删除任意 Markdown 层级的“目录”标题行。"""
+
+    lines = [line for line in text.splitlines() if not DIRECTORY_HEADING_RE.match(line)]
+    return "\n".join(lines) + ("\n" if lines else "")
+
+
+def parse_outline(text, require_headings=True, allow_missing_pages=False):
+    """解析目录标题、可选书本页码及 Markdown 层级，并拒绝格式异常行。"""
 
     entries = []
     for line_number, line in enumerate(text.splitlines(), start=1):
         if not line.strip():
             continue
-        match = OUTLINE_RE.match(line.strip())
-        if not match or (require_headings and not match.group("heading")):
+        stripped = line.strip()
+        match = OUTLINE_RE.match(stripped)
+        if match and (not require_headings or match.group("heading")):
+            heading = (match.group("heading") or "").strip()
+            title = match.group("title").strip()
+            catalog_page = int(match.group("page"))
+        elif allow_missing_pages:
+            title_match = OUTLINE_TITLE_RE.match(stripped)
+            if require_headings and not title_match:
+                raise ValueError(f"outline 第 {line_number} 行格式错误：{line}")
+            heading = title_match.group("heading") if title_match else ""
+            title = (
+                title_match.group("title").strip()
+                if title_match
+                else re.sub(r"^#{1,6}\s+", "", stripped).strip()
+            )
+            catalog_page = None
+        else:
             raise ValueError(f"outline 第 {line_number} 行格式错误：{line}")
-        heading = (match.group("heading") or "").strip()
         entries.append(
             {
-                "title": match.group("title").strip(),
-                "catalog_page": int(match.group("page")),
+                "title": title,
+                "catalog_page": catalog_page,
                 "level": len(heading) if heading else None,
             }
         )
@@ -439,11 +478,15 @@ def parse_outline(text, require_headings=True):
     return entries
 
 
-def validate_outline_response(raw_outline, llm_outline):
+def validate_outline_response(raw_outline, llm_outline, allow_missing_pages=False):
     """确认模型只增加目录层级，没有改动标题、页码、数量或顺序。"""
 
-    raw_entries = parse_outline(raw_outline, require_headings=False)
-    llm_entries = parse_outline(llm_outline, require_headings=True)
+    raw_entries = parse_outline(
+        raw_outline, require_headings=False, allow_missing_pages=allow_missing_pages
+    )
+    llm_entries = parse_outline(
+        llm_outline, require_headings=True, allow_missing_pages=allow_missing_pages
+    )
     raw_values = [(normalize_title(e["title"]), e["catalog_page"]) for e in raw_entries]
     llm_values = [(normalize_title(e["title"]), e["catalog_page"]) for e in llm_entries]
     if raw_values != llm_values:
@@ -454,18 +497,27 @@ def validate_outline_response(raw_outline, llm_outline):
 def format_outline(entries):
     """把结构化目录条目序列化为约定的 Markdown 目录格式。"""
 
-    return "\n".join(
-        f"{'#' * entry['level']} {entry['title']}……{entry['catalog_page']}" for entry in entries
-    ) + "\n"
+    text = "\n".join(
+        f"{'#' * entry['level']} {entry['title']}"
+        + (f"……{entry['catalog_page']}" if entry["catalog_page"] is not None else "")
+        for entry in entries
+    )
+    return text + ("\n" if text else "")
 
 
-async def build_outline(raw_outline, model):
+async def build_outline(raw_outline, model, numbered=True):
     """流式调用目录分层模型，实时打印思考和输出并返回完整目录。"""
 
+    page_rule = (
+        "不得增加、删除、改写、合并、拆分标题，不得修改页码和顺序。\n"
+        "每行格式必须是：## 标题……页码。"
+        if numbered
+        else "不得增加、删除、改写、合并、拆分标题，不得虚构页码或修改顺序。\n"
+        "每行格式必须是：## 标题。"
+    )
     prompt = f"""请根据完整目录判断标题层级，只为每一行添加 Markdown 标题井号。
 最高级标题必须使用 ##，下级依次使用 ###、####、#####、######。
-不得增加、删除、改写、合并、拆分标题，不得修改页码和顺序。
-每行格式必须是：## 标题……页码。不要输出说明、代码围栏或空白段落。
+{page_rule}不要输出说明、代码围栏或空白段落。
 
 目录：
 {raw_outline}"""
@@ -515,6 +567,9 @@ def remove_excluded_outline_entries(entries, excluded_tasks, page_offset, book):
 
     kept = []
     for entry in entries:
+        if entry["catalog_page"] is None:
+            kept.append(entry)
+            continue
         actual_page = entry["catalog_page"] + page_offset
         excluded = next(
             (
@@ -532,6 +587,80 @@ def remove_excluded_outline_entries(entries, excluded_tasks, page_offset, book):
         else:
             kept.append(entry)
     return kept
+
+
+def remove_excluded_pageless_outline_entries(entries, excluded_tasks, book):
+    """将无页码目录视为一列标题，按表 B 的标题开闭区间删除反选内容。"""
+
+    normalized_titles = [normalize_title(entry["title"]) for entry in entries]
+    intervals = []
+    for task, reason in sorted(excluded_tasks, key=lambda item: item[0]["start_page"]):
+        start_title = normalize_title(task["chapter"])
+        start_index = next(
+            (index for index, title in enumerate(normalized_titles) if title == start_title),
+            None,
+        )
+        if start_index is None:
+            print(f"目录反选边界未找到：{book}｜开头={task['chapter']}（可能已清理）")
+            continue
+
+        end_chapter = task["end_chapter"]
+        if not end_chapter or end_chapter == "-":
+            end_index = len(entries)
+        else:
+            end_title = normalize_title(end_chapter)
+            end_index = next(
+                (
+                    index
+                    for index in range(start_index + 1, len(entries))
+                    if normalized_titles[index] == end_title
+                ),
+                None,
+            )
+            if end_index is None:
+                print(
+                    f"目录反选边界未找到：{book}｜开头={task['chapter']}｜"
+                    f"结尾={end_chapter}"
+                )
+                continue
+        intervals.append((start_index, end_index, task, reason))
+
+    removed = set()
+    for start_index, end_index, task, reason in intervals:
+        for index in range(start_index, end_index):
+            if index not in removed:
+                print(
+                    f"目录反选删除：{book}｜{entries[index]['title']}｜"
+                    f"表 B 标题区间 [{task['chapter']}, {task['end_chapter']})｜{reason}"
+                )
+            removed.add(index)
+    return [entry for index, entry in enumerate(entries) if index not in removed]
+
+
+def seed_outline_pages_from_tasks(entries, tasks, page_offset):
+    """用表 B 章节起始页为无页码目录中的同名章节补充确定页码。"""
+
+    for task in sorted(tasks, key=lambda item: item["start_page"]):
+        target = normalize_title(task["chapter"])
+        entry = next(
+            (
+                item
+                for item in entries
+                if item["catalog_page"] is None and normalize_title(item["title"]) == target
+            ),
+            None,
+        )
+        if entry:
+            entry["catalog_page"] = task["start_page"] - page_offset
+
+
+def book_uses_pageless_outline(book_dir):
+    """读取目录 OCR 中间文件，判断 compare 是否使用无页码标题回填流程。"""
+
+    raw_path = book_dir / "outline.md"
+    if not raw_path.is_file():
+        raise FileNotFoundError(f"缺少目录 OCR 中间文件：{raw_path}")
+    return not outline_has_page_numbers(raw_path.read_text(encoding="utf-8"))
 
 
 async def outline_stage(tasks, infos, model, dry_run):
@@ -556,26 +685,49 @@ async def outline_stage(tasks, infos, model, dry_run):
             book_dir = OUTPUT_DIR / book
             final_dir = book_dir / "final_result"
             final_dir.mkdir(parents=True, exist_ok=True)
-            pdf_bytes = paddle.extract_pdf_range(pdf_path, info["toc_start"], info["toc_end"])
-            layout_results = await paddle_layout(pdf_bytes, client, f"{book} 目录")
-            expected = info["toc_end"] - info["toc_start"]
-            if len(layout_results) != expected:
-                raise RuntimeError(f"{book} 目录应返回 {expected} 页，实际 {len(layout_results)} 页")
-            results = await paddle_restructure(layout_results, client, True, f"{book} 目录")
-            if len(results) != 1:
-                raise RuntimeError(f"{book} 合并目录应返回 1 个结果，实际 {len(results)} 个")
-            raw_outline = filter_numbered_outline_lines(inline_result_images(results[0]))
-            (book_dir / "outline.md").write_text(raw_outline, encoding="utf-8")
+            raw_path = book_dir / "outline.md"
+            outline_path = final_dir / "outline.md"
+            if raw_path.is_file():
+                raw_outline = raw_path.read_text(encoding="utf-8")
+                print(f"跳过目录 OCR，已存在：{raw_path}")
+            else:
+                pdf_bytes = paddle.extract_pdf_range(
+                    pdf_path, info["toc_start"], info["toc_end"]
+                )
+                layout_results = await paddle_layout(pdf_bytes, client, f"{book} 目录")
+                expected = info["toc_end"] - info["toc_start"]
+                if len(layout_results) != expected:
+                    raise RuntimeError(
+                        f"{book} 目录应返回 {expected} 页，实际 {len(layout_results)} 页"
+                    )
+                results = await paddle_restructure(layout_results, client, True, f"{book} 目录")
+                if len(results) != 1:
+                    raise RuntimeError(f"{book} 合并目录应返回 1 个结果，实际 {len(results)} 个")
+                raw_outline = inline_result_images(results[0])
+
+            numbered = outline_has_page_numbers(raw_outline)
+            raw_outline = (
+                filter_numbered_outline_lines(raw_outline)
+                if numbered
+                else filter_pageless_outline_lines(raw_outline)
+            )
+            raw_path.write_text(raw_outline, encoding="utf-8")
+
+            if outline_path.is_file():
+                print(f"跳过目录 AI 识别，已存在：{outline_path}")
+                continue
 
             print(f"开始目录 AI 识别：{book}")
-            llm_outline = await build_outline(raw_outline, model)
+            llm_outline = await build_outline(raw_outline, model, numbered)
             try:
-                entries = validate_outline_response(raw_outline, llm_outline)
+                entries = validate_outline_response(
+                    raw_outline, llm_outline, allow_missing_pages=not numbered
+                )
             except ValueError:
                 (book_dir / "outline_llm_failed.md").write_text(llm_outline, encoding="utf-8")
                 raise
-            (final_dir / "outline.md").write_text(format_outline(entries), encoding="utf-8")
-            print(f"已生成：{final_dir / 'outline.md'}")
+            outline_path.write_text(format_outline(entries), encoding="utf-8")
+            print(f"已生成：{outline_path}")
     print("outline 阶段完成，请人工检查 final_result/outline.md 后运行 compare。")
 
 
@@ -844,21 +996,36 @@ def prepare_compare_outputs(books, overwrite):
                 path.unlink()
 
 
-def apply_outline_exclusions(excluded, infos):
+def apply_outline_exclusions(tasks, excluded, infos):
     """在 compare 开始时从已确认目录中删除落入反选页段的标题。"""
 
+    tasks_by_book = group_tasks(tasks)
     excluded_by_book = {}
     for task, reason in excluded:
         excluded_by_book.setdefault(task["pdf_path"].stem, []).append((task, reason))
 
     for book, excluded_tasks in excluded_by_book.items():
-        outline_path = OUTPUT_DIR / book / "final_result" / "outline.md"
+        book_dir = OUTPUT_DIR / book
+        outline_path = book_dir / "final_result" / "outline.md"
         if not outline_path.is_file():
             raise FileNotFoundError(f"请先完成人工目录检查：{outline_path}")
-        entries = parse_outline(outline_path.read_text(encoding="utf-8"), require_headings=True)
-        entries = remove_excluded_outline_entries(
-            entries, excluded_tasks, infos[book]["page_offset"], book
+        pageless = book_uses_pageless_outline(book_dir)
+        entries = parse_outline(
+            outline_path.read_text(encoding="utf-8"),
+            require_headings=True,
+            allow_missing_pages=pageless,
         )
+        if pageless:
+            entries = remove_excluded_pageless_outline_entries(entries, excluded_tasks, book)
+            excluded_rows = {task["row_number"] for task, _ in excluded_tasks}
+            included_tasks = [
+                task for task in tasks_by_book[book] if task["row_number"] not in excluded_rows
+            ]
+            seed_outline_pages_from_tasks(entries, included_tasks, infos[book]["page_offset"])
+        else:
+            entries = remove_excluded_outline_entries(
+                entries, excluded_tasks, infos[book]["page_offset"], book
+            )
         outline_path.write_text(format_outline(entries), encoding="utf-8")
 
 
@@ -869,11 +1036,19 @@ def compare_book(book, tasks, info):
     final_dir = book_dir / "final_result"
     outline_path = final_dir / "outline.md"
     review_path = final_dir / "review.xlsx"
+    (final_dir / "unexist_outlines.md").unlink(missing_ok=True)
 
-    entries = parse_outline(outline_path.read_text(encoding="utf-8"), require_headings=True)
+    pageless = book_uses_pageless_outline(book_dir)
+    entries = parse_outline(
+        outline_path.read_text(encoding="utf-8"),
+        require_headings=True,
+        allow_missing_pages=pageless,
+    )
+    pending = [entry for entry in entries if entry["catalog_page"] is None]
     titles_by_page = {}
     for entry in entries:
-        titles_by_page.setdefault(entry["catalog_page"] + info["page_offset"], []).append(entry)
+        if entry["catalog_page"] is not None:
+            titles_by_page.setdefault(entry["catalog_page"] + info["page_offset"], []).append(entry)
 
     paddle_output = book_dir / "PaddleOCR" / "output"
     paddle_layout_dir = book_dir / "PaddleOCR" / "layout"
@@ -894,6 +1069,21 @@ def compare_book(book, tasks, info):
         paddle_layout = json.loads(paddle_json_path.read_text(encoding="utf-8"))
         mineru_layout = json.loads(mineru_json_path.read_text(encoding="utf-8"))
 
+        found_titles = headings_in_markdown(paddle_md)
+        if pageless:
+            for found_title in found_titles:
+                entry = next(
+                    (
+                        item
+                        for item in pending
+                        if normalize_title(item["title"]) == found_title
+                    ),
+                    None,
+                )
+                if entry:
+                    entry["catalog_page"] = page - info["page_offset"]
+                    pending.remove(entry)
+
         if (
             markdown_has_media(paddle_md)
             or markdown_has_media(mineru_md)
@@ -905,44 +1095,60 @@ def compare_book(book, tasks, info):
         if normalized_markdown(paddle_md) != normalized_markdown(mineru_md):
             issues.append((page, "OCR冲突"))
             continue
-        expected_titles = titles_by_page.get(page, [])
-        found_titles = headings_in_markdown(paddle_md)
-        missing_titles = [
-            entry["title"]
-            for entry in expected_titles
-            if normalize_title(entry["title"]) not in found_titles
-        ]
-        if missing_titles:
-            print(f"标题查找失败：{book} 第 {page} 页：{', '.join(missing_titles)}")
-            issues.append((page, "标题查找失败"))
-            continue
+        if not pageless:
+            expected_titles = titles_by_page.get(page, [])
+            missing_titles = [
+                entry["title"]
+                for entry in expected_titles
+                if normalize_title(entry["title"]) not in found_titles
+            ]
+            if missing_titles:
+                print(f"标题查找失败：{book} 第 {page} 页：{', '.join(missing_titles)}")
+                issues.append((page, "标题查找失败"))
+                continue
         if not normalized_markdown(paddle_md).strip():
             issues.append((page, "空白页面"))
             continue
         shutil.copy2(mineru_md_path, final_dir / f"page_{page}.md")
 
+    if pageless:
+        pending = [entry for entry in entries if entry["catalog_page"] is None]
+        outline_path.write_text(format_outline(entries), encoding="utf-8")
+
     create_review_xlsx(review_path, issues)
     print(f"已生成：{review_path}（{len(issues)} 个待复核页面）")
+    return len(pending) if pageless else 0
 
 
 async def compare_stage(included, excluded, infos, overwrite, dry_run):
     """执行入选正文页的双 OCR 转换、自动对比和人工复核表生成。"""
 
     included_tasks = [task for task, _ in included]
+    all_tasks = included_tasks + [task for task, _ in excluded]
     by_book = group_tasks(included_tasks)
     if dry_run:
         for book, book_tasks in by_book.items():
             print(f"compare dry-run：{book}，{len(page_metadata(book_tasks))} 页")
         return
 
-    apply_outline_exclusions(excluded, infos)
+    apply_outline_exclusions(all_tasks, excluded, infos)
     prepare_compare_outputs(by_book, overwrite)
+    incomplete_outlines = []
     async with httpx.AsyncClient(timeout=None) as client:
         for book, book_tasks in by_book.items():
             await convert_paddle_book(book, book_tasks, client)
             await convert_mineru_book(book, book_tasks, client)
-            compare_book(book, book_tasks, infos[book])
-    print("compare 阶段完成，请填写 final_result/review.xlsx 后运行 finalize。")
+            missing_count = compare_book(book, book_tasks, infos[book])
+            if missing_count:
+                incomplete_outlines.append(
+                    (book, OUTPUT_DIR / book / "final_result" / "outline.md", missing_count)
+                )
+    if incomplete_outlines:
+        print("compare 阶段完成，请填写 review.xlsx，并补全以下 outline.md 后再运行 finalize：")
+        for book, outline_path, missing_count in incomplete_outlines:
+            print(f"  {book}：{outline_path}（{missing_count} 项）")
+    else:
+        print("compare 阶段完成，请填写 final_result/review.xlsx 后运行 finalize。")
 
 
 def read_review(path):
